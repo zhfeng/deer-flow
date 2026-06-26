@@ -26,7 +26,7 @@ from app.channels.message_bus import (
     OutboundMessage,
     ResolvedAttachment,
 )
-from app.channels.run_policy import CHANNEL_RUN_POLICY
+from app.channels.run_policy import CHANNEL_RUN_POLICY, ChannelRunPolicy
 from app.channels.store import ChannelStore
 from app.gateway.csrf_middleware import CSRF_COOKIE_NAME, CSRF_HEADER_NAME, generate_csrf_token
 from app.gateway.internal_auth import create_internal_auth_headers
@@ -937,7 +937,7 @@ class ChannelManager:
 
         return assistant_id, run_config, run_context
 
-    async def _apply_channel_policy(self, msg: InboundMessage, run_context: dict[str, Any]) -> None:
+    async def _apply_channel_policy(self, msg: InboundMessage, run_context: dict[str, Any]) -> ChannelRunPolicy | None:
         """Apply per-channel run policy that needs ``run_context`` access.
 
         Run AFTER ``_resolve_run_params`` (which produced ``run_context``)
@@ -955,10 +955,15 @@ class ChannelManager:
         ``recursion_limit`` is applied inside :meth:`_resolve_run_params`
         instead because it lives on ``run_config`` (not ``run_context``)
         and the resolver already builds ``run_config``.
+
+        Returns the resolved :class:`ChannelRunPolicy` (or ``None`` when
+        the channel has no entry) so :meth:`_handle_chat` can branch on
+        flags like ``fire_and_forget`` without doing a second dict
+        lookup.
         """
         policy = CHANNEL_RUN_POLICY.get(msg.channel_name)
         if policy is None:
-            return
+            return None
         if not policy.is_interactive:
             run_context["disable_clarification"] = True
         if policy.credentials_provider is not None:
@@ -973,6 +978,7 @@ class ChannelManager:
                     msg.channel_name,
                     exc_info=True,
                 )
+        return policy
 
     def _resolve_available_skill_names(self, msg: InboundMessage) -> set[str] | None:
         thread_id = self.store.get_thread_id(msg.channel_name, msg.chat_id, topic_id=msg.topic_id) or ""
@@ -1440,7 +1446,7 @@ class ChannelManager:
         # webhook channels. Driven by CHANNEL_RUN_POLICY so each new
         # webhook channel is a one-row registration, not a fresh
         # if-branch here.
-        await self._apply_channel_policy(msg, run_context)
+        policy = await self._apply_channel_policy(msg, run_context)
 
         # If the inbound message contains file attachments, let the channel
         # materialize (download) them and update msg.text to include sandbox file paths.
@@ -1475,7 +1481,6 @@ class ChannelManager:
             )
             return
 
-        logger.info("[Manager] invoking runs.wait(thread_id=%s, text_len=%d)", thread_id, len(msg.text or ""))
         run_kwargs: dict[str, Any] = {
             "input": {"messages": [human_message]},
             "config": run_config,
@@ -1484,6 +1489,35 @@ class ChannelManager:
         }
         if owner_headers := _owner_headers(msg):
             run_kwargs["headers"] = owner_headers
+
+        if policy is not None and policy.fire_and_forget:
+            # Fire-and-forget path: the channel does its own outbound
+            # during the run (GitHub agents post to the issue/PR via the
+            # ``gh`` CLI from inside the sandbox), so there is nothing
+            # for the manager to ferry back. Use ``runs.create`` — a
+            # short POST that returns once the run is ``pending`` — to
+            # avoid the SDK's 300s ``httpx.ReadTimeout`` on legitimately
+            # long autonomous runs, and the false "internal error"
+            # outbound that follows when it fires. ``ConflictError`` is
+            # still raised synchronously by ``start_run`` if a previous
+            # run on this thread is still active, so the existing
+            # busy-thread path is preserved.
+            logger.info(
+                "[Manager] invoking runs.create(thread_id=%s, text_len=%d) [fire_and_forget]",
+                thread_id,
+                len(msg.text or ""),
+            )
+            try:
+                await client.runs.create(thread_id, assistant_id, **run_kwargs)
+            except Exception as exc:
+                if _is_thread_busy_error(exc):
+                    logger.warning("[Manager] thread busy (concurrent run rejected): thread_id=%s", thread_id)
+                    await self._send_error(msg, THREAD_BUSY_MESSAGE)
+                    return
+                raise
+            return
+
+        logger.info("[Manager] invoking runs.wait(thread_id=%s, text_len=%d)", thread_id, len(msg.text or ""))
         try:
             result = await client.runs.wait(
                 thread_id,

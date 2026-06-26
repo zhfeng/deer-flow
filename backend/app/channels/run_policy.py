@@ -63,12 +63,26 @@ class ChannelRunPolicy:
             to DeerFlow user is encoded in the agent's ``config.yaml``
             ownership, not in the channel-connections table. Defaults to
             True (the safe default for an interactive IM channel).
+        fire_and_forget: When True, the manager schedules the run with
+            ``runs.create`` (returns immediately once the run is
+            ``pending``) instead of ``runs.wait`` (which keeps an HTTP
+            stream open for the entire run lifetime). Channels that do
+            their own outbound during the run — e.g. GitHub, where the
+            agent posts to the issue/PR via the ``gh`` CLI in its
+            sandbox — don't need the manager to ferry a final state
+            back. Eliminates the SDK's 300s ``httpx.ReadTimeout`` on
+            runs that legitimately take more than 5 minutes, and the
+            false "internal error" outbound that follows when it
+            fires. Defaults to False (the safe default for an
+            interactive IM channel that depends on the manager to
+            publish the agent's reply).
     """
 
     is_interactive: bool = True
     default_recursion_limit: int | None = None
     credentials_provider: Callable[[InboundMessage, dict[str, Any]], Awaitable[None]] | None = None
     requires_bound_identity: bool = True
+    fire_and_forget: bool = False
 
 
 # Channel name → policy. Channels absent from this map fall through to

@@ -3100,6 +3100,235 @@ class TestResolveRunParamsUserId:
         assert "channel_user_id" not in run_context
 
 
+class TestGithubFireAndForget:
+    """Regression for the ``httpx.ReadTimeout`` on long autonomous GitHub runs.
+
+    The GitHub channel's outbound ``send`` is log-only by design — the agent
+    posts to the issue/PR via the ``gh`` CLI from inside the sandbox. Keeping
+    ``client.runs.wait`` on the manager side kept an HTTP stream open for the
+    entire run lifetime, so any run that legitimately exceeded the SDK default
+    300s read deadline (a routine clone → edit → test → push → PR cycle) blew
+    up with ``httpx.ReadTimeout`` and the outer except branch then released the
+    dedupe key and emitted a false "internal error" outbound.
+
+    The fix is policy-driven: ``ChannelRunPolicy.fire_and_forget=True`` swaps
+    the dispatch call to ``runs.create`` (short POST, returns once the run is
+    ``pending``) and skips the response-extraction + outbound-publish block.
+    """
+
+    def test_channel_run_policy_default_is_not_fire_and_forget(self):
+        """Adding ``fire_and_forget`` must not silently re-route any existing
+        channel onto the new path — the default has to stay False so Slack,
+        Telegram, Discord, etc. keep using ``runs.wait`` exactly as before."""
+        from app.channels.run_policy import ChannelRunPolicy
+
+        assert ChannelRunPolicy().fire_and_forget is False
+
+    def test_github_channel_policy_opts_into_fire_and_forget(self):
+        """The GitHub channel must register ``fire_and_forget=True``. This is
+        the only signal the manager has to skip ``runs.wait`` for github."""
+        # Importing the github subpackage registers the policy as a side
+        # effect (``register_policy()`` runs at module import time).
+        import app.gateway.github.run_policy  # noqa: F401
+        from app.channels.run_policy import CHANNEL_RUN_POLICY
+
+        github_policy = CHANNEL_RUN_POLICY.get("github")
+        assert github_policy is not None
+        assert github_policy.fire_and_forget is True
+
+    def test_handle_chat_for_github_calls_runs_create_not_wait(self):
+        """The hot path: a github inbound dispatches via ``runs.create``, not
+        ``runs.wait``. ``runs.create`` returns once the run is ``pending`` so
+        the manager doesn't have to hold an HTTP stream open for ~6 minutes."""
+        import app.gateway.github.run_policy  # noqa: F401 — register policy
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            # GitHub deliveries skip the bound-identity gate (authenticity is
+            # enforced at the webhook route by HMAC), but constructing the
+            # manager with the default require_bound_identity=False keeps the
+            # test focused on the dispatch path rather than the gate.
+            manager = ChannelManager(bus=bus, store=store)
+
+            mock_client = _make_mock_langgraph_client(thread_id="gh-thread-1")
+            # Wire runs.create as an AsyncMock — _make_mock_langgraph_client
+            # only wires runs.wait. Returning the same {"thread_id": ...} dict
+            # mirrors what the real SDK returns from POST /threads/{id}/runs.
+            mock_client.runs.create = AsyncMock(return_value={"run_id": "run-abc", "status": "pending"})
+            manager._client = mock_client
+
+            await manager._handle_chat(
+                InboundMessage(
+                    channel_name="github",
+                    chat_id="zhfeng/llm-gateway",
+                    user_id="zhfeng",
+                    owner_user_id="agent-owner-1",
+                    text="please fix the bug in foo.py",
+                )
+            )
+
+            mock_client.runs.create.assert_called_once()
+            # And — crucially — ``runs.wait`` must NOT have been called. Any
+            # regression that keeps the long-poll alive for github would
+            # immediately re-introduce the ``httpx.ReadTimeout`` symptom.
+            mock_client.runs.wait.assert_not_called()
+
+            create_args = mock_client.runs.create.call_args
+            assert create_args[0][0] == "gh-thread-1"  # thread_id
+            assert create_args[0][1] == "lead_agent"  # assistant_id
+            # multitask_strategy must still be ``reject`` — concurrent runs on
+            # the same GitHub thread are surfaced via ConflictError below.
+            assert create_args[1]["multitask_strategy"] == "reject"
+
+        _run(go())
+
+    def test_handle_chat_for_github_does_not_publish_outbound(self):
+        """Fire-and-forget channels publish nothing on success. The GitHub
+        agent posts to the issue/PR itself via the ``gh`` CLI; if the manager
+        ALSO published an outbound, the channel's log-only ``send`` would
+        write a final-state message into ``gateway.log`` for every run and
+        muddy the operator-facing logs. The streaming-path counterpart of
+        this guarantee already holds — this pins the non-streaming side."""
+        import app.gateway.github.run_policy  # noqa: F401 — register policy
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received: list[OutboundMessage] = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            mock_client = _make_mock_langgraph_client(thread_id="gh-thread-2")
+            mock_client.runs.create = AsyncMock(return_value={"run_id": "run-xyz", "status": "pending"})
+            manager._client = mock_client
+
+            await manager.start()
+            try:
+                await manager._handle_chat(
+                    InboundMessage(
+                        channel_name="github",
+                        chat_id="zhfeng/llm-gateway",
+                        user_id="zhfeng",
+                        owner_user_id="agent-owner-1",
+                        text="please add a test for the empty case",
+                    )
+                )
+                # Give the bus a chance to flush anything that might have
+                # been published. Nothing should arrive — but if a future
+                # regression starts publishing again we want this test to see
+                # it, not race against it.
+                await asyncio.sleep(0.05)
+            finally:
+                await manager.stop()
+
+            assert outbound_received == []
+            mock_client.runs.create.assert_called_once()
+            mock_client.runs.wait.assert_not_called()
+
+        _run(go())
+
+    def test_handle_chat_for_github_busy_thread_still_emits_busy_message(self):
+        """A ``ConflictError`` from ``runs.create`` (the runtime rejected the
+        run because a previous one on the same thread is still active) must
+        still trip the ``THREAD_BUSY_MESSAGE`` outbound path. The GitHub
+        channel's ``send`` is log-only, so in practice the operator sees the
+        busy message in ``gateway.log`` rather than on the PR — but the manager
+        must treat this exactly like the ``runs.wait`` case so any future
+        non-github fire-and-forget channel inherits the behavior unchanged."""
+        import httpx
+        from langgraph_sdk.errors import ConflictError
+
+        import app.gateway.github.run_policy  # noqa: F401 — register policy
+        from app.channels.manager import THREAD_BUSY_MESSAGE, ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            outbound_received: list[OutboundMessage] = []
+
+            async def capture_outbound(msg):
+                outbound_received.append(msg)
+
+            bus.subscribe_outbound(capture_outbound)
+
+            request = httpx.Request("POST", "http://127.0.0.1:2024/threads/gh-thread-3/runs")
+            response = httpx.Response(409, request=request)
+            conflict = ConflictError(
+                "Thread is already running a task. Wait for it to finish or choose a different multitask strategy.",
+                response=response,
+                body={"message": "Thread is already running a task."},
+            )
+
+            mock_client = _make_mock_langgraph_client(thread_id="gh-thread-3")
+            mock_client.runs.create = AsyncMock(side_effect=conflict)
+            manager._client = mock_client
+
+            await manager.start()
+            try:
+                await manager._handle_chat(
+                    InboundMessage(
+                        channel_name="github",
+                        chat_id="zhfeng/llm-gateway",
+                        user_id="zhfeng",
+                        owner_user_id="agent-owner-1",
+                        text="ping",
+                    )
+                )
+                await _wait_for(lambda: any(m.text == THREAD_BUSY_MESSAGE for m in outbound_received))
+            finally:
+                await manager.stop()
+
+            busy = [m for m in outbound_received if m.text == THREAD_BUSY_MESSAGE]
+            assert len(busy) == 1
+            assert busy[0].channel_name == "github"
+            mock_client.runs.create.assert_called_once()
+            mock_client.runs.wait.assert_not_called()
+
+        _run(go())
+
+    def test_handle_chat_for_non_fire_and_forget_channel_still_uses_runs_wait(self):
+        """Regression guard for the non-github channels (Slack, DingTalk,
+        WeCom, etc.) — they still need the manager to ferry the final
+        assistant message back, so the ``runs.wait`` dispatch path must stay
+        intact when ``fire_and_forget`` is False or the channel has no policy
+        entry at all."""
+        from app.channels.manager import ChannelManager
+
+        async def go():
+            bus = MessageBus()
+            store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+            manager = ChannelManager(bus=bus, store=store)
+
+            mock_client = _make_mock_langgraph_client(thread_id="slack-thread-1")
+            # runs.create is wired so we can prove it is NOT used for slack.
+            mock_client.runs.create = AsyncMock(return_value={"run_id": "should-not-be-used"})
+            manager._client = mock_client
+
+            await manager._handle_chat(
+                InboundMessage(
+                    channel_name="slack",
+                    chat_id="C1",
+                    user_id="U1",
+                    text="hi",
+                )
+            )
+
+            mock_client.runs.wait.assert_called_once()
+            mock_client.runs.create.assert_not_called()
+
+        _run(go())
+
+
 class _BoundIdentityRepo:
     def __init__(self, connections: list[dict[str, str | None]] | None = None) -> None:
         self.connections = list(connections or [])

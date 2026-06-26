@@ -118,6 +118,17 @@ def register_policy() -> None:
         # the agent even when channel_connections.enabled=True for
         # interactive IM channels in the same deployment.
         requires_bound_identity=False,
+        # GitHub agents post their own outbound to the issue/PR via the
+        # ``gh`` CLI in the sandbox; the channel's ``send`` is log-only
+        # by design. We don't need to keep an HTTP stream open on
+        # ``runs.wait`` for ~6-minute coding runs and then watch it die
+        # at the SDK's 300s ``httpx.ReadTimeout``. Fire-and-forget swaps
+        # the manager call to ``runs.create`` (returns immediately once
+        # the run is ``pending``) and skips the response-extraction +
+        # outbound-publish block. ``ConflictError`` on a busy thread is
+        # still raised synchronously by ``start_run`` before the run is
+        # accepted, so the busy-thread path is preserved.
+        fire_and_forget=True,
     )
 
 
