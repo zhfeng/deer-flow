@@ -180,6 +180,23 @@ _CONTEXT_CONFIGURABLE_KEYS: frozenset[str] = frozenset(
 # arbitrary HTTP/IM clients must not be able to force autonomous execution.
 _INTERNAL_ONLY_CONTEXT_KEYS: frozenset[str] = frozenset({"non_interactive"})
 
+# Keys forwarded from ``body.context`` into ``config['context']`` ONLY (the
+# runtime context that becomes ``ToolRuntime.context`` / ``runtime.context``),
+# never into ``config['configurable']``. These are read by tools and
+# middlewares from ``runtime.context`` and have no reason to live in
+# ``configurable`` — and ``configurable`` is persisted in checkpoints, so
+# keeping secrets like ``github_token`` out of it avoids writing a
+# short-lived installation token into the checkpoint store.
+#
+#   ``github_token``         — App installation token minted by the GitHub
+#                              channel; the bash tool exposes it as
+#                              ``GH_TOKEN``/``GITHUB_TOKEN`` so ``gh`` and
+#                              ``git`` push as the bot, not the host user.
+#   ``disable_clarification`` — set for non-interactive channels (GitHub
+#                              webhooks) so ClarificationMiddleware proceeds
+#                              instead of dead-ending the run.
+_CONTEXT_ONLY_KEYS: frozenset[str] = frozenset({"github_token", "disable_clarification"})
+
 
 def strip_internal_context_keys(config: dict[str, Any]) -> None:
     """Drop internal-only keys a non-internal caller smuggled into the run config.
@@ -208,10 +225,14 @@ def merge_run_context_overrides(config: dict[str, Any], context: Mapping[str, An
     ``setdefault`` so a server-authenticated id stamped by
     :func:`inject_authenticated_user_context` always wins over the client-supplied one.
 
-    ``internal=True`` (the request authenticated as the process-internal user,
-    e.g. the scheduler's ``launch_scheduled_thread_run``) additionally honors
     :data:`_INTERNAL_ONLY_CONTEXT_KEYS`; those keys are dropped from client
     requests.
+
+    A second set of keys (``_CONTEXT_ONLY_KEYS`` — e.g. ``github_token``,
+    ``disable_clarification``) is forwarded into ``config['context']`` only, never
+    ``configurable``. These are secrets / runtime flags read by tools and middlewares
+    from ``runtime.context``; keeping them out of ``configurable`` avoids persisting a
+    short-lived token in the checkpoint store.
     """
     if not context:
         return
@@ -224,6 +245,11 @@ def merge_run_context_overrides(config: dict[str, Any], context: Mapping[str, An
                 configurable.setdefault(key, context[key])
             if isinstance(runtime_context, dict):
                 runtime_context.setdefault(key, context[key])
+    # Context-only keys (secrets / runtime flags) land in ``config['context']``
+    # only — never ``configurable`` (which is persisted in checkpoints).
+    for key in _CONTEXT_ONLY_KEYS:
+        if key in context and isinstance(runtime_context, dict):
+            runtime_context.setdefault(key, context[key])
     if "user_id" in context and isinstance(runtime_context, dict):
         runtime_context.setdefault("user_id", context["user_id"])
     # The raw platform user id from IM channels (Feishu open_id, Slack Uxxx, ...)

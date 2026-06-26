@@ -381,6 +381,7 @@ class TestChannelBase:
         from app.channels.dingtalk import DingTalkChannel
         from app.channels.discord import DiscordChannel
         from app.channels.feishu import FeishuChannel
+        from app.channels.github import GitHubChannel
         from app.channels.manager import CHANNEL_CAPABILITIES
         from app.channels.slack import SlackChannel
         from app.channels.telegram import TelegramChannel
@@ -392,6 +393,7 @@ class TestChannelBase:
             "dingtalk": DingTalkChannel(bus=bus, config={}).supports_streaming,
             "discord": DiscordChannel(bus=bus, config={}).supports_streaming,
             "feishu": FeishuChannel(bus=bus, config={}).supports_streaming,
+            "github": GitHubChannel(bus=bus, config={}).supports_streaming,
             "slack": SlackChannel(bus=bus, config={}).supports_streaming,
             "telegram": TelegramChannel(bus=bus, config={}).supports_streaming,
             "wechat": WechatChannel(bus=bus, config={}).supports_streaming,
@@ -2827,6 +2829,26 @@ class TestResolveRunParamsUserId:
         assert run_context["user_id"] == "123456"
         assert run_context["channel_user_id"] == "123456"
 
+    def test_resolve_run_params_plumbs_channel_name_into_run_context(self):
+        """``channel_name`` must land on ``run_context`` so in-graph code can
+        gate tool exposure on it.
+
+        Concretely: the lead-agent factory withholds the ``update_agent``
+        tool from runs whose ``run_context["channel_name"]`` is webhook-shaped
+        (currently ``"github"``). If this plumbing regresses, the factory
+        loses the only signal it has to make that decision and webhook
+        runs silently regain a privilege-escalation path.
+        """
+        manager = self._manager()
+
+        gh_msg = InboundMessage(channel_name="github", chat_id="acme/widget", user_id="alice", text="hi")
+        _, _, gh_ctx = manager._resolve_run_params(gh_msg, "thread-1")
+        assert gh_ctx["channel_name"] == "github"
+
+        tg_msg = InboundMessage(channel_name="telegram", chat_id="c", user_id="42", text="hi")
+        _, _, tg_ctx = manager._resolve_run_params(tg_msg, "thread-2")
+        assert tg_ctx["channel_name"] == "telegram"
+
     @pytest.mark.parametrize(
         "kwargs",
         [
@@ -2868,6 +2890,117 @@ class TestResolveRunParamsUserId:
 
         assert run_context["user_id"] == "deerflow-user-1"
         assert run_context["channel_user_id"] == "U-platform"
+
+    def test_github_channel_gets_raised_recursion_limit(self):
+        """Autonomous GitHub coding runs (clone → edit → test → push → PR) need
+        more super-steps than an interactive chat turn. The default
+        ``recursion_limit`` of 100 is raised for the github channel only."""
+        manager = self._manager()
+
+        gh_msg = InboundMessage(channel_name="github", chat_id="zhfeng/llm-gateway", user_id="zhfeng", text="hi")
+        _, gh_config, _ = manager._resolve_run_params(gh_msg, "thread-1")
+        assert gh_config["recursion_limit"] >= 250
+
+        # Interactive channels keep the default ceiling.
+        slack_msg = InboundMessage(channel_name="slack", chat_id="C1", user_id="u", text="hi")
+        _, slack_config, _ = manager._resolve_run_params(slack_msg, "thread-1")
+        assert slack_config["recursion_limit"] == 100
+
+    def test_github_channel_recursion_limit_respects_higher_override(self):
+        """An explicit higher recursion_limit in channel/user config must not be
+        lowered by the github bump (it uses ``max``)."""
+        manager = self._manager()
+        manager._default_session["config"] = {"recursion_limit": 400}
+
+        gh_msg = InboundMessage(channel_name="github", chat_id="zhfeng/llm-gateway", user_id="zhfeng", text="hi")
+        _, gh_config, _ = manager._resolve_run_params(gh_msg, "thread-1")
+        assert gh_config["recursion_limit"] == 400
+
+    def test_github_channel_per_agent_recursion_limit_override(self):
+        """An agent's ``github.recursion_limit`` overrides the channel default.
+
+        Some autonomous workloads (large refactors, multi-file migrations)
+        need more headroom than 250; others (review-only agents) need less.
+        The per-agent value flows via ``msg.metadata["github"]["recursion_limit"]``
+        — the dispatcher reads it from ``GitHubAgentConfig`` at fanout time.
+        The per-agent value is honored verbatim, including values below the
+        channel default and below 100.
+        """
+        manager = self._manager()
+
+        # Higher than the channel default — agent gets the bigger ceiling.
+        gh_msg = InboundMessage(
+            channel_name="github",
+            chat_id="zhfeng/llm-gateway",
+            user_id="zhfeng",
+            text="hi",
+            metadata={"github": {"recursion_limit": 500}},
+        )
+        _, gh_config, _ = manager._resolve_run_params(gh_msg, "thread-1")
+        assert gh_config["recursion_limit"] == 500
+
+        # Below the channel default — agent gets the lower ceiling.
+        gh_msg_low = InboundMessage(
+            channel_name="github",
+            chat_id="zhfeng/llm-gateway",
+            user_id="zhfeng",
+            text="hi",
+            metadata={"github": {"recursion_limit": 120}},
+        )
+        _, gh_config_low, _ = manager._resolve_run_params(gh_msg_low, "thread-1")
+        assert gh_config_low["recursion_limit"] == 120
+
+    def test_github_channel_per_agent_recursion_limit_honors_value_below_100(self):
+        """Regression pin for willem-bd's finding #4 on PR #3754.
+
+        Previously the channel-policy step did ``max(existing, limit)``
+        which clamped any per-agent recursion_limit below 100 up to 100,
+        silently breaking a safety-conscious ``github.recursion_limit: 50``
+        on a review-only agent. The per-agent value is now honored
+        verbatim for any positive integer, including values below 100.
+        """
+        manager = self._manager()
+
+        # 50: well below the 100 floor that the old max() would have applied,
+        # AND below the 250 channel default. Both clamps would silently lose
+        # this setting; the per-agent value must win.
+        gh_msg = InboundMessage(
+            channel_name="github",
+            chat_id="zhfeng/llm-gateway",
+            user_id="zhfeng",
+            text="hi",
+            metadata={"github": {"recursion_limit": 50}},
+        )
+        _, gh_config, _ = manager._resolve_run_params(gh_msg, "thread-1")
+        assert gh_config["recursion_limit"] == 50
+
+        # Boundary just-below-default to pin the contract: the override
+        # always wins over the channel default, no matter the relative size.
+        for value in (1, 25, 99, 100, 249, 250, 251, 1024):
+            gh_msg = InboundMessage(
+                channel_name="github",
+                chat_id="zhfeng/llm-gateway",
+                user_id="zhfeng",
+                text="hi",
+                metadata={"github": {"recursion_limit": value}},
+            )
+            _, gh_config, _ = manager._resolve_run_params(gh_msg, "thread-1")
+            assert gh_config["recursion_limit"] == value, f"override {value!r} must be honored verbatim"
+
+    def test_github_channel_recursion_limit_ignores_invalid_override(self):
+        """Non-int / non-positive recursion_limit values fall back to the channel default."""
+        manager = self._manager()
+
+        for bad in (None, 0, -1, "many", 3.5):
+            gh_msg = InboundMessage(
+                channel_name="github",
+                chat_id="zhfeng/llm-gateway",
+                user_id="zhfeng",
+                text="hi",
+                metadata={"github": {"recursion_limit": bad}},
+            )
+            _, gh_config, _ = manager._resolve_run_params(gh_msg, "thread-1")
+            assert gh_config["recursion_limit"] == 250, f"bad value {bad!r} should fall back to 250"
 
     def test_auth_disabled_user_id_is_used_for_unbound_channel_messages(self, monkeypatch):
         from app.gateway.auth_disabled import AUTH_DISABLED_USER_ID
@@ -3404,6 +3537,61 @@ class TestChannelManagerBoundIdentityPolicy:
             mock_client.threads.create.assert_called_once()
 
         _run(go())
+
+    def test_webhook_channel_run_policy_opts_out_of_bound_identity_gate(self, monkeypatch):
+        """A channel whose ChannelRunPolicy declares ``requires_bound_identity=False``
+        is exempt from the per-sender bound-identity gate, even when
+        ``require_bound_identity=True`` is on for interactive IM channels in the
+        same deployment. This is what lets GitHub webhook deliveries reach the
+        agent: they are HMAC-authenticated at the route, and the sender→DeerFlow
+        binding lives in the agent's config.yaml ownership, not in the
+        channel-connections table.
+        """
+        from app.channels.manager import ChannelManager
+        from app.channels.run_policy import CHANNEL_RUN_POLICY, ChannelRunPolicy
+
+        monkeypatch.delenv("DEER_FLOW_AUTH_DISABLED", raising=False)
+
+        # Save+restore so test parallelism / re-import side effects from
+        # app.gateway.github.run_policy don't leak across tests.
+        original = CHANNEL_RUN_POLICY.get("webhook-fixture")
+        CHANNEL_RUN_POLICY["webhook-fixture"] = ChannelRunPolicy(
+            is_interactive=False,
+            requires_bound_identity=False,
+        )
+        try:
+
+            async def go():
+                bus = MessageBus()
+                store = ChannelStore(path=Path(tempfile.mkdtemp()) / "store.json")
+                manager = ChannelManager(bus=bus, store=store, require_bound_identity=True)
+                mock_client = _make_mock_langgraph_client(thread_id="thread-webhook")
+                manager._client = mock_client
+
+                await manager._handle_chat(
+                    InboundMessage(
+                        channel_name="webhook-fixture",
+                        chat_id="repo-owner/repo-name",
+                        user_id="commenter-login",
+                        # owner_user_id is set by the dispatcher from the
+                        # agent binding, NOT from a channel-connection row.
+                        owner_user_id="agent-installer-user",
+                        text="hi",
+                    )
+                )
+
+                # If the gate fired, threads.create would never be called and
+                # one outbound rejection would be on the bus instead. We
+                # assert the agent path ran.
+                mock_client.threads.create.assert_called_once()
+                mock_client.runs.wait.assert_called_once()
+
+            _run(go())
+        finally:
+            if original is None:
+                CHANNEL_RUN_POLICY.pop("webhook-fixture", None)
+            else:
+                CHANNEL_RUN_POLICY["webhook-fixture"] = original
 
 
 class TestChannelManagerConnectionRouting:
@@ -4392,6 +4580,41 @@ class TestChannelService:
             for ch_status in status["channels"].values():
                 assert ch_status["enabled"] is False
                 assert ch_status["running"] is False
+
+            await service.stop()
+
+        _run(go())
+
+    def test_is_channel_enabled_reflects_live_config(self):
+        """``is_channel_enabled`` is the runtime kill-switch read by the GitHub
+        webhook router. Verify it tracks the live ``_config`` dict, including
+        updates from ``configure_channel`` (which the UI uses to flip the
+        enabled flag without rewriting ``config.yaml``).
+        """
+        from app.channels.service import ChannelService
+
+        async def go():
+            service = ChannelService(
+                channels_config={
+                    "github": {"enabled": True, "default_mention_login": "bot"},
+                    "feishu": {"enabled": False},
+                }
+            )
+            await service.start()
+
+            # Configured + enabled → True.
+            assert service.is_channel_enabled("github") is True
+            # Configured + disabled → False.
+            assert service.is_channel_enabled("feishu") is False
+            # Not present at all → False (don't fail open).
+            assert service.is_channel_enabled("slack") is False
+            # Non-dict garbage in config → False (defensive).
+            service._config["broken"] = "not a dict"
+            assert service.is_channel_enabled("broken") is False
+
+            # Runtime flip via configure_channel must be visible.
+            await service.configure_channel("github", {"enabled": False})
+            assert service.is_channel_enabled("github") is False
 
             await service.stop()
 
