@@ -62,6 +62,7 @@ SKILLS_HOST_PATH = os.environ.get("SKILLS_HOST_PATH", "/skills")
 THREADS_HOST_PATH = os.environ.get("THREADS_HOST_PATH", "/.deer-flow/threads")
 SKILLS_PVC_NAME = os.environ.get("SKILLS_PVC_NAME", "")
 USERDATA_PVC_NAME = os.environ.get("USERDATA_PVC_NAME", "")
+SANDBOX_CONTAINER_PORT = int(os.environ.get("SANDBOX_CONTAINER_PORT", "8080"))
 SAFE_THREAD_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 SAFE_USER_ID_PATTERN = r"^[A-Za-z0-9_\-]+$"
 DEFAULT_USER_ID = "default"
@@ -320,14 +321,14 @@ def _build_pod(sandbox_id: str, thread_id: str, user_id: str = DEFAULT_USER_ID) 
                     ports=[
                         k8s_client.V1ContainerPort(
                             name="http",
-                            container_port=8080,
+                            container_port=SANDBOX_CONTAINER_PORT,
                             protocol="TCP",
                         )
                     ],
                     readiness_probe=k8s_client.V1Probe(
                         http_get=k8s_client.V1HTTPGetAction(
                             path="/v1/sandbox",
-                            port=8080,
+                            port=SANDBOX_CONTAINER_PORT,
                         ),
                         initial_delay_seconds=5,
                         period_seconds=5,
@@ -337,7 +338,7 @@ def _build_pod(sandbox_id: str, thread_id: str, user_id: str = DEFAULT_USER_ID) 
                     liveness_probe=k8s_client.V1Probe(
                         http_get=k8s_client.V1HTTPGetAction(
                             path="/v1/sandbox",
-                            port=8080,
+                            port=SANDBOX_CONTAINER_PORT,
                         ),
                         initial_delay_seconds=10,
                         period_seconds=10,
@@ -387,8 +388,8 @@ def _build_service(sandbox_id: str) -> k8s_client.V1Service:
             ports=[
                 k8s_client.V1ServicePort(
                     name="http",
-                    port=8080,
-                    target_port=8080,
+                    port=SANDBOX_CONTAINER_PORT,
+                    target_port=SANDBOX_CONTAINER_PORT,
                     protocol="TCP",
                     # nodePort omitted → K8s auto-allocates from the range
                 )
