@@ -132,3 +132,24 @@ imagePullSecrets:
 {{- define "deer-flow.nginxChecksum" -}}
 {{- include (print $.Template.BasePath "/configmap-nginx.yaml") . | sha256sum -}}
 {{- end -}}
+
+{{/* Percent-encode a string for safe interpolation into a URL userinfo
+     (password) segment of a DSN. Sprig lacks urlqueryescape, and
+     regexReplaceAllLiteral treats `replacement` as a regex template so chars
+     like `[`, `]`, `?` break it - so we chain plain `replace` calls instead.
+     `%` is encoded first to avoid double-encoding the percent signs emitted
+     for the other characters. Covers the URL-special chars a managed-DB
+     password might contain (`@ : / # ? % [ ]` and space). */}}
+{{- define "deer-flow.urlEscape" -}}
+{{- $s := . -}}
+{{- $s = replace "%" "%25" $s -}}
+{{- $s = replace "@" "%40" $s -}}
+{{- $s = replace ":" "%3A" $s -}}
+{{- $s = replace "/" "%2F" $s -}}
+{{- $s = replace "#" "%23" $s -}}
+{{- $s = replace "?" "%3F" $s -}}
+{{- $s = replace "[" "%5B" $s -}}
+{{- $s = replace "]" "%5D" $s -}}
+{{- $s = replace " " "%20" $s -}}
+{{- $s -}}
+{{- end -}}

@@ -82,9 +82,11 @@ provisioner:
       memory: 512Mi
   # -- AIO-compatible sandbox container image used for sandbox Pods.
   sandboxImage: "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest"
-  # -- Host the gateway uses to reach sandbox NodePorts. In compose this is
-  #    `host.docker.internal`; in K8s set to a node IP or an in-cluster address
-  #    that routes to NodePorts. See NOTES.txt for the caveat.
+  # -- Host the gateway uses to reach sandbox NodePorts. Empty (default) falls
+  #    back to the provisioner pod's node IP via the Kubernetes downward API,
+  #    which routes on most clusters because a NodePort is exposed on every
+  #    node. Set explicitly only when pod->node-IP traffic is blocked by your
+  #    CNI/network policy. In Docker Compose this is `host.docker.internal`.
   nodeHost: ""
   # -- Sandbox container port (must match the sandboxImage's listening port).
   sandboxPort: 8080

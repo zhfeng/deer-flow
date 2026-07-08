@@ -49,7 +49,7 @@ spec:
           args:
             - >-
               cp /etc/nginx/nginx.conf.template /tmp/nginx.conf &&
-              test -e /proc/net/if_inet6 || sed -i '/^[[:space:]]*listen[[:space:]]\+\[::\]:2026;/d' /tmp/nginx.conf &&
+              test -e /proc/net/if_inet6 || sed -i '/^[[:space:]]*listen[[:space:]]\+\[::\]:2026[[:space:]]/d' /tmp/nginx.conf &&
               nginx -c /tmp/nginx.conf -g 'daemon off;'
           readinessProbe:
             httpGet:

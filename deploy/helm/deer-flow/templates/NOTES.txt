@@ -37,15 +37,16 @@ Provisioner / sandbox notes:
     PVC for per-thread user-data.
 
   ⚠️  Sandbox NodePort reachability:
-    The provisioner returns `http://{{ .Values.provisioner.nodeHost | default "gateway" }}:{NodePort}`
-    to the gateway so the agent can talk to its sandbox. In Docker Compose this
-    is `host.docker.internal`; in Kubernetes a NodePort is only reachable via a
-    node IP or a service that routes to it. For a single-node local cluster
-    (kind/Docker Desktop/OrbStack), set `provisioner.nodeHost` to a node IP:
+    The provisioner returns `http://{NODE_HOST}:{NodePort}` to the gateway so
+    the agent can talk to its sandbox. NODE_HOST defaults to the provisioner
+    pod's node IP via the Kubernetes downward API, which routes on most clusters
+    because a NodePort is exposed on every node.
+
+    If your CNI or network policy blocks pod->node-IP traffic, set
+    `provisioner.nodeHost` to an address the gateway can reach that routes to
+    a node IP:
 
       kubectl get nodes -o wide
-
-    and update values:
 
       provisioner:
         nodeHost: <node-InternalIP-or-ExternalIP>

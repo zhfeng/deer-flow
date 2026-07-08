@@ -320,12 +320,17 @@ an opt-in root `volumePermissions` initContainer that chowns on every start (the
 Bitnami pattern) — is not yet wired into this chart; it would introduce a root
 container, so it's left as an operator decision for now.
 
-## Sandbox NodePort reachability (important caveat)
+## Sandbox NodePort reachability
 
 The provisioner returns `http://{NODE_HOST}:{NodePort}` to the gateway so the
 agent can reach its sandbox. In Docker Compose `NODE_HOST=host.docker.internal`;
-in Kubernetes a NodePort is reachable via a **node IP**, not `localhost`. For
-single-node local clusters, set `provisioner.nodeHost` to a node IP:
+in Kubernetes `NODE_HOST` **defaults to the provisioner pod's node IP** via the
+[downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/)
+(`status.hostIP`). Because a NodePort is exposed on every node, the gateway can
+reach `<node-IP>:<NodePort>` on most clusters without any configuration.
+
+Override `provisioner.nodeHost` only if your CNI or network policy blocks
+pod->node-IP traffic:
 
 ```bash
 kubectl get nodes -o wide    # use INTERNAL-IP or EXTERNAL-IP
