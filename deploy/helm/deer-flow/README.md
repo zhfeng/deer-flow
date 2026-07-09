@@ -103,7 +103,7 @@ they resolve from the `secrets` map):
 
 ```yaml
 config: |
-  config_version: 15
+  config_version: 19
   models:
     - name: gpt-4
       use: langchain_openai:ChatOpenAI
@@ -121,6 +121,34 @@ config: |
     connection_string: $DATABASE_URL
   stream_bridge:
     type: redis   # cross-pod SSE; URL from DEER_FLOW_STREAM_BRIDGE_REDIS_URL
+  # Tools MUST be listed explicitly - the agent gets none otherwise
+  # (BUILTIN_TOOLS only adds present_file + ask_clarification). The chart
+  # default in values.yaml enables the sandbox tools + web tools (web_search,
+  # web_fetch, image_search - no API key); when you override `config:`, copy
+  # them in. Full list in values.yaml / config.example.yaml. The web tools need
+  # outbound egress from the gateway pod.
+  tool_groups:
+    - name: web
+    - name: file:read
+    - name: file:write
+    - name: bash
+  tools:
+    - name: web_search
+      group: web
+      use: deerflow.community.ddg_search.tools:web_search_tool
+      max_results: 5
+    - name: web_fetch
+      group: web
+      use: deerflow.community.jina_ai.tools:web_fetch_tool
+      timeout: 10
+    - name: image_search
+      group: web
+      use: deerflow.community.image_search.tools:image_search_tool
+      max_results: 5
+    - name: bash
+      group: bash
+      use: deerflow.sandbox.tools:bash_tool
+    # also: ls, read_file, glob, grep, write_file, str_replace (see values.yaml)
 ```
 
 `$DATABASE_URL` is injected from the postgres Secret (see below). The
@@ -128,6 +156,10 @@ config: |
 Store (cross-thread memory + thread list) reads it and does not fall back to
 `database:`. `stream_bridge.type: redis` is the default and routes live SSE
 events through the bundled redis StatefulSet (or `redis.external`).
+Because `config:` is a single override blob, a partial `config:` replaces the
+chart default entirely - keep the `tools:`/`tool_groups:` block (or the agent
+will have no tools) and the `sandbox:`/`database:`/`checkpointer:`/`stream_bridge:`
+sections shown above.
 
 ## 3. Install (from a local chart checkout)
 

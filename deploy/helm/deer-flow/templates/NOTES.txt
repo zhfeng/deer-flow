@@ -116,6 +116,12 @@ $VAR.
     under `secrets` in your values, or the agent will have no LLM to call.
 {{- end }}
 
+Agent tools: the chart enables the sandbox tools (ls, read_file, glob, grep,
+write_file, str_replace, bash - run inside the AIO sandbox) and web tools
+(web_search, web_fetch, image_search - no API key) by default. Add or swap
+tools under `config` -> `tools:` (see config.example.yaml); the web tools need
+outbound internet from the gateway pod.
+
 Pod security:
   • All pods run non-root: gateway/frontend/provisioner uid 1000, nginx uid 101,
     postgres uid 999. All Linux capabilities are dropped and privilege escalation
