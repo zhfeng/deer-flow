@@ -200,8 +200,10 @@ kubectl -n deer-flow exec deploy/deer-flow-provisioner -- curl -s localhost:8002
   user-data mode. Default `ReadWriteOnce`; use `ReadWriteMany` (NFS) on
   multi-node clusters so sandbox Pods on other nodes can mount it.
 - **Provisioner RBAC.** The provisioner gets a ServiceAccount with a namespaced
-  Role (pods/services) and a narrow ClusterRole (namespace get/create). It uses
-  in-cluster service-account creds — no kubeconfig mount.
+  Role (get/list/watch/create/delete on pods + services) and a narrow ClusterRole
+  (namespace get/create). It uses in-cluster service-account creds — no
+  kubeconfig mount. The unused update/patch/pods-exec/events verbs were dropped
+  (audited against `docker/provisioner/app.py`).
 - **Skills.** Disabled by default (emptyDir at `/app/skills`). Populate via
   `skills.existingClaim` or `skills.configMap`, or bake skills into a custom
   gateway image.
@@ -264,11 +266,11 @@ per-workload with testing:
   non-root by default (defense in depth — the chart already forces the uid via
   `securityContext`, so this is not required). A cluster enforcing the
   `restricted` Pod Security Admission standard would require this setting.
-- **Provisioner RBAC narrowing.** The provisioner's Role grants
-  create/get/list/watch/delete on pods and services in the namespace, plus
-  namespace create cluster-wide. A narrower policy would scope verbs/resources to
-  the minimum the sandbox lifecycle actually needs — audit
-  `docker/provisioner/app.py` first.
+- **Provisioner RBAC narrowing.** The Role grants get/list/watch/create/delete
+  on pods and services in the namespace (update/patch/pods-exec/events were
+  dropped as unused). These verbs still apply to *all* Pods in the namespace,
+  not just sandbox Pods — RBAC can't scope by label, so the remaining
+  options are a dedicated sandbox namespace or admission control (OPA/Kyverno).
 - **`startupProbe`.** Workloads have readiness + liveness probes but no startup
   probe. The gateway's `livenessProbe.initialDelaySeconds: 30` covers slow starts
   today; a `startupProbe` would let it take arbitrarily long to initialize
