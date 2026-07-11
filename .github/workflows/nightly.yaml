@@ -12,7 +12,7 @@ name: Nightly Build
 # Artifacts (under the running repo's owner):
 #   ghcr.io/<owner>/deer-flow-{backend,frontend,provisioner}:nightly
 #   ghcr.io/<owner>/deer-flow-{backend,frontend,provisioner}:nightly-YYYYMMDD
-#   oci://ghcr.io/<owner>/deer-flow   chart version <base>-nightly.YYYYMMDD
+#   oci://ghcr.io/<owner>/deer-flow   chart version <base>-nightly.YYYYMMDD-<sha>
 #
 # The nightly chart defaults image.tag=nightly and image.registry=ghcr.io/<owner>
 # (patched in-workflow, never committed), so installing it pulls the matching
@@ -67,22 +67,10 @@ jobs:
         run: helm template deer-flow deploy/helm/deer-flow --include-crds >/dev/null
 
       # The chart's `config:` block embeds a config_version that must not fall
-      # behind config.example.yaml. Mirrors chart.yaml's drift check.
+      # behind config.example.yaml. Shared with chart.yaml via
+      # scripts/check_config_version.sh so the two workflows can't drift.
       - name: config_version drift check
-        run: |
-          set -eu
-          example=$(grep -E '^config_version:[[:space:]]+[0-9]+' config.example.yaml | head -1 | awk '{print $2}')
-          chart=$(awk '/^config:[[:space:]]*\|/{f=1; next} f && /^[[:space:]]+config_version:[[:space:]]+[0-9]+/ {print $2; exit}' deploy/helm/deer-flow/values.yaml)
-          echo "config.example.yaml config_version=$example"
-          echo "chart values.yaml     config_version=$chart"
-          if [ -z "$example" ] || [ -z "$chart" ]; then
-            echo "::error::could not parse config_version from one of the files"
-            exit 1
-          fi
-          if [ "$chart" -lt "$example" ]; then
-            echo "::error::chart config_version ($chart) is behind config.example.yaml ($example). Bump 'config_version' in deploy/helm/deer-flow/values.yaml (and the README example) to $example."
-            exit 1
-          fi
+        run: bash scripts/check_config_version.sh
 
   build-images:
     needs: prepare
@@ -127,8 +115,10 @@ jobs:
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 #v5.7.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          # `nightly` rolls forward each run; `nightly-YYYYMMDD` pins a day.
-          # No `latest` (that stays on v* releases) and no branch/tag refs.
+          # `nightly` rolls forward each run; `nightly-YYYYMMDD` is pinned to a
+          # day but mutable within it (a same-day re-dispatch overwrites it);
+          # `sha-<short>` is the only truly immutable tag. No `latest` (that
+          # stays on v* releases) and no branch/tag refs.
           tags: |
             type=raw,value=nightly
             type=raw,value=nightly-${{ needs.prepare.outputs.date }}
@@ -168,20 +158,31 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6.0.3
 
       - name: Patch chart to a nightly version + nightly image defaults
-        # Bumps Chart.yaml version/appVersion to <base>-nightly.YYYYMMDD (valid
-        # semver prerelease; unique per day for OCI immutability) and repoints
-        # the chart's default image registry/tag at the nightly build. These
-        # patches are in-workflow only - nothing is committed back.
+        # Bumps Chart.yaml version/appVersion to <base>-nightly.<date>-<sha>
+        # (valid semver prerelease; the short SHA makes each dispatch's version
+        # unique, so a same-day re-dispatch re-publishes cleanly - OCI chart
+        # versions are immutable and otherwise can't be overwritten). Repoints
+        # the chart's default image registry/tag at the nightly build. Patches
+        # are in-workflow only - nothing is committed back.
         run: |
           set -eu
           CHART=deploy/helm/deer-flow
           BASE=$(grep -m1 '^version:' "$CHART/Chart.yaml" | awk '{print $2}')
-          NIGHTLY="${BASE}-nightly.${DATE}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          NIGHTLY="${BASE}-nightly.${DATE}-${SHORT_SHA}"
           echo "Nightly chart version: ${NIGHTLY}"
           sed -i "s|^version:.*|version: ${NIGHTLY}|" "$CHART/Chart.yaml"
           sed -i "s|^appVersion:.*|appVersion: \"${NIGHTLY}\"|" "$CHART/Chart.yaml"
           sed -i "s|^  registry: \"\".*|  registry: \"ghcr.io/${OWNER}\"|" "$CHART/values.yaml"
           sed -i 's|^  tag: "latest"|  tag: "nightly"|' "$CHART/values.yaml"
+          # Gate the patches: sed exits 0 even on zero matches, so a drifted
+          # Chart.yaml/values.yaml would otherwise ship a chart that silently
+          # pulls the wrong (release `latest`) images. Fail loudly if any patch
+          # missed.
+          grep -q "^version: ${NIGHTLY}$"         "$CHART/Chart.yaml"  || { echo "::error::Chart.yaml version sed did not apply"; exit 1; }
+          grep -q "^appVersion: \"${NIGHTLY}\"$"   "$CHART/Chart.yaml"  || { echo "::error::Chart.yaml appVersion sed did not apply"; exit 1; }
+          grep -q '^  registry: "ghcr.io/'         "$CHART/values.yaml" || { echo "::error::values.yaml registry sed did not apply"; exit 1; }
+          grep -q '^  tag: "nightly"'              "$CHART/values.yaml" || { echo "::error::values.yaml tag sed did not apply"; exit 1; }
           echo "--- Chart.yaml (head) ---"; sed -n '1,7p' "$CHART/Chart.yaml"
           echo "--- image block ---"; sed -n '11,14p' "$CHART/values.yaml"
 
