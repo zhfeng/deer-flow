@@ -61,7 +61,14 @@ jobs:
         # version) and publish-chart stamps it on Chart.yaml, so the version
         # users see and the chart version can't drift apart.
         run: |
+          set -euo pipefail
           BASE=$(grep -m1 '^version:' deploy/helm/deer-flow/Chart.yaml | awk '{print $2}')
+          # A malformed/missing Chart.yaml version would yield an empty BASE ->
+          # `-nightly.<date>-<sha>` (invalid semver) that now flows into both
+          # the chart publish and the frontend About-page version. Fail loudly.
+          # `pipefail` matters: without it the pipeline's exit code is awk's,
+          # so `set -e` alone wouldn't catch a grep miss.
+          test -n "$BASE" || { echo "::error::empty base version from Chart.yaml"; exit 1; }
           SHORT_SHA="${GITHUB_SHA::7}"
           NIGHTLY="${BASE}-nightly.${{ steps.date.outputs.date }}-${SHORT_SHA}"
           echo "nightly_version=${NIGHTLY}" >> "$GITHUB_OUTPUT"
