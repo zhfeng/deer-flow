@@ -24,8 +24,11 @@ test("aboutMarkdown heading interpolates the app version", async () => {
 
 test("aboutMarkdown heading reflects the package version when env is unset", async () => {
   delete process.env.NEXT_PUBLIC_APP_VERSION;
+  const { APP_VERSION } = await import("@/version");
   const { aboutMarkdown } =
     await import("@/components/workspace/settings/about-content");
-  // The stale hardcoded "2.0" must be gone - the heading uses APP_VERSION.
-  expect(aboutMarkdown).not.toContain("About DeerFlow 2.0]");
+  // Positive: the heading carries the real resolved version. This catches an
+  // empty or undefined APP_VERSION interpolation (`About DeerFlow ]` /
+  // `About DeerFlow undefined]`), not just removal of the old literal.
+  expect(aboutMarkdown).toContain(`[About DeerFlow ${APP_VERSION}]`);
 });
