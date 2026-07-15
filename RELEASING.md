@@ -161,3 +161,8 @@ is safe — no images or chart were pushed to overwrite.
 Optionally draft a **GitHub Release** from the tag, pasting the corresponding
 `CHANGELOG.md` section as the release notes. The changelog link references
 point at these release URLs.
+
+For the 2.1.0 chart release (the first chart release), pre-`charts/` nightly
+builds remain at the legacy bare `ghcr.io/<owner>/deer-flow` package. That
+package receives no new versions after 2.1.0; delete it or revoke its
+visibility once nothing still pulls from it.
