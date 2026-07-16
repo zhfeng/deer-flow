@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **sandbox:** The Helm chart now defaults per-sandbox Services to `ClusterIP`
+  instead of `NodePort`, so the code-execution sandbox is reachable only inside
+  the cluster via Service DNS (`http://sandbox-<id>-svc.<ns>.svc.cluster.local`)
+  and is no longer bound on every node's interfaces - including the
+  externally-reachable ones on GKE/EKS/AKS. Existing chart installs flip
+  NodePort -> ClusterIP on upgrade. To preserve the old reachability (an
+  external probe hitting the 30xxx port, or the Docker-Compose/hybrid path
+  where the gateway is not in K8s), set `provisioner.sandboxServiceType: NodePort`
+  (with `provisioner.nodeHost` if needed). The provisioner itself is unchanged
+  (mode-aware since #4016). ([#4190])
+
 ### Fixed
 
 - **models:** Honor `api_base` on every `BaseChatOpenAI` subclass (`VllmChatModel`,
@@ -531,3 +544,4 @@ with **180 merged pull requests** since the first 2.0 milestone tag.
 [#3657]: https://github.com/bytedance/deer-flow/pull/3657
 [#3658]: https://github.com/bytedance/deer-flow/pull/3658
 [#4146]: https://github.com/bytedance/deer-flow/pull/4146
+[#4190]: https://github.com/bytedance/deer-flow/pull/4190
